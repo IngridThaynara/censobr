@@ -1,10 +1,14 @@
 # Fazendo a instalação do pacote censobr
 #install.packages("censobr")
 
+rm(list=ls())
 # Fazendo a liberação dos pacotes necessários para a criação dos indicadores
 library(censobr)
 library(arrow)
 library(tidyverse)
+library(dplyr)
+library(naniar)
+library(skimr)
 
 # HELP da função utilizada nesse script
 ?censobr::read_tracts
@@ -12,7 +16,7 @@ library(tidyverse)
 # Acesso ao dicionário dos codigos:
 censobr::data_dictionary(year = 2022, dataset = "tracts")
 
-# Tabela basica do censobr apenas 36 vars
+# Tabela basica do censobr apenas 36 variáveis
 basico <- read_tracts(
   year = 2022,
   dataset = 'Basico',
@@ -65,6 +69,10 @@ responsavel_renda <- read_tracts(
 )%>%
   filter(code_state == 33)
 
+# Verficando quais são as variáveis presentes nas 4 bases que importamos no Script
+#é essencial para fazermos o join corretamente.
+intersect(names(basico), names(pessoas)) |> intersect(names(domicilio)) |> intersect(names(responsavel_renda))
+
 # Criando um vetor com as 29 primeiras variáveis do basico
 chaves <- names(basico)[1:29]
 
@@ -74,155 +82,229 @@ base <- basico %>%
   left_join(domicilio, by = chaves) %>%
   left_join(responsavel_renda, by = chaves)
 
+# Exportando o banco de dados do censo 2022
 write.csv(base, "base_censo2022_rj.csv", row.names = FALSE)
 
-var <- names(base)
+# Agrupando a base por setor censitário para nível municipal
 
-library(dplyr)
-library(tidyr)
+# Variáveis fixas que não podem ser somadas
+fixas_proibidas <- c(
+  "code_tract",
+  "situacao", "code_situacao", "code_type",
+  "code_district", "name_district",
+  "code_subdistrict", "name_subdistrict",
+  "code_neighborhood", "name_neighborhood",
+  "code_nucleo_urbano", "name_nucleo_urbano",
+  "code_favela", "name_favela",
+  "code_aglomerado", "name_aglomerado",
+  "code_muni", "name_muni",
+  "area_km2"
+)
 
-# === 1. Indicadores DEMOGRÁFICOS ===============================
+# 2) Fixas válidas = primeiras 29 menos fixas proibidas
+fixas <- names(base)[1:29]
+fixas_validas <- setdiff(fixas, fixas_proibidas)
 
-## 1) Densidade Demográfica
-ind1 <- base %>%
-  mutate(densidade = V0001 / area_km2) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(densidade = sum(densidade, na.rm = TRUE))
+# Variáveis que não podem ser somadas nunca
+nao_somar <- c(fixas_proibidas, fixas_validas)
 
+# Variáveis realmente somáveis (numéricas e não proibidas)
+variaveis_somar <- base %>%
+  select(-all_of(nao_somar)) %>%
+  select(where(is.numeric)) %>%
+  names()
 
-## 2) Índice de Urbanização
-ind2 <- base %>%
-  mutate(pop_urb = if_else(situacao == "Urbana", V0001, 0)) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(ind_urbanizacao = sum(pop_urb) / sum(V0001))
+# EVITAR QUE code_muni APAREÇA POR ACIDENTE:
+variaveis_somar <- setdiff(variaveis_somar, c("code_muni"))
 
-
-## 3) Razão de Dependência
-base_dep <- base %>%
-  mutate(
-    pop_0_14 = rowSums(select(., demografia_V01031:demografia_V01033), na.rm = TRUE),
-    pop_15_64 = rowSums(select(., demografia_V01034:demografia_V01038), na.rm = TRUE),
-    pop_65mais = rowSums(select(., demografia_V01039:demografia_V01041), na.rm = TRUE)
-  )
-
-ind3 <- base_dep %>%
+# Agregando a base a nível municipal:
+base_mun <- base %>%
   group_by(code_muni, name_muni) %>%
   summarise(
-    razao_dependencia = (sum(pop_0_14) + sum(pop_65mais)) / sum(pop_15_64)
+    across(all_of(fixas_validas), first),
+    area_km2 = sum(area_km2, na.rm = TRUE),
+    across(all_of(variaveis_somar), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
   )
 
+# Reorganizando a base municipal
+base_mun <- base_mun |>
+  select(-c(code_intermediate,name_intermediate,code_immediate,name_immediate,code_urban_concentration,name_urban_concentration))
 
-## 4) Proporção de Idosos 65+
-ind4 <- base_dep %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_idosos = sum(pop_65mais) / sum(V0001))
+# Verificando a quantidade de dados faltantes nas colunas
 
-## 5) Proporção de Domicílios Permanentes
-ind5 <- base %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_dom_permanentes = sum(domicilio01_V00010, na.rm = TRUE) /
-              sum(domicilio01_V00001, na.rm = TRUE))
+gg_miss_var(base_mun)
 
+glimpse(base_mun)
 
-# === 2. Indicadores SOCIAIS =====================================
+base_mun$code_muni = as.factor(base_mun$code_muni)
 
-## 6) Proporção de Chefes Mulheres
-ind6 <- base %>%
+# Indicadores criados a partir da base_mun
+
+# Densidade Demográfica
+
+ind1 <- base_mun %>%
+  mutate(densidade_demografica = V0001 / area_km2) %>%
+  select(code_muni, name_muni, densidade_demografica)
+
+summary(ind1)
+# Não há dados faltantes
+
+# Índice de Urbanização
+ind2 <- base_mun %>%
+  mutate(indice_de_urbanizacao = V0002 / V0001) %>%
+  select(code_muni, name_muni, indice_de_urbanizacao)
+
+summary(ind2)
+# Não há dados faltantes
+
+# Razão de Dependência
+
+ind3 <- base_mun %>%
   mutate(
-    chefes_total = parentesco_V01062 + parentesco_V01063,
-    prop_chefes_mulheres = parentesco_V01063 / chefes_total
+    pop_0_14   = demografia_V01031 + demografia_V01032 + demografia_V01033,
+    pop_15_64  = demografia_V01034 + demografia_V01035 + demografia_V01036 + demografia_V01037 + demografia_V01038,
+    pop_65mais = demografia_V01039 + demografia_V01040 + demografia_V01041,
+    razao_dependencia = (pop_0_14 + pop_65mais) / pop_15_64
   ) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_chefes_mulheres = weighted.mean(prop_chefes_mulheres, V0001, na.rm = TRUE))
+  select(code_muni, name_muni, razao_dependencia)
 
+summary(ind3)
+# Não há dados faltantes
 
-## 7) PFSP — Proporção de Filhos sem Presença Paterna
-ind7 <- base %>%
+# Proporção de Idosos (65+)
+
+ind4 <- base_mun %>%
+  mutate(
+    pop_65mais = demografia_V01039 + demografia_V01040 + demografia_V01041,
+    proporcao_idosos = pop_65mais / V0001
+  ) %>%
+  select(code_muni, name_muni, proporcao_idosos)
+
+summary(ind4)
+# Não há dados faltantes
+
+# Taxa0 de Domicílios Permanentes
+ind5 <- base_mun %>%
+  mutate(prop_dom_permanentes = (domicilio01_V00010 / domicilio01_V00001)*10000) %>%
+  select(code_muni, name_muni, prop_dom_permanentes)
+
+summary(ind5)
+# Não há dados faltantes
+
+# Proporção de Chefes Mulheres
+ind6 <- base_mun %>%
+  mutate(
+    total_chefes = parentesco_V01062 + parentesco_V01063,
+    prop_chefes_mulheres = parentesco_V01063 / total_chefes
+  ) %>%
+  select(code_muni, name_muni, prop_chefes_mulheres)
+
+summary(ind6)
+# Não há dados faltantes
+
+# Filhos Sem Presença Paterna (PFSP)
+ind7 <- base_mun %>%
   mutate(
     filhos_sem_pai = parentesco_V01045,
-    filhos_total = rowSums(select(., parentesco_V01042:parentesco_V01050), na.rm = TRUE)
+    filhos_total   = parentesco_V01042 + parentesco_V01043 + parentesco_V01044 +
+      parentesco_V01045 + parentesco_V01046 + parentesco_V01047 +
+      parentesco_V01048 + parentesco_V01049 + parentesco_V01050,
+    pfsp = filhos_sem_pai / filhos_total
   ) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(pfsp = sum(filhos_sem_pai) / sum(filhos_total))
+  select(code_muni, name_muni, pfsp)
 
+summary(ind7)
+# Não há dados faltantes
 
-## 8) Tamanho Médio dos Domicílios
-ind8 <- base %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(tamanho_medio_dom = sum(V0001) / sum(domicilio01_V00001))
+# Tamanho Médio do Domicílio
+ind8 <- base_mun %>%
+  mutate(tamanho_medio_dom = V0001 / domicilio01_V00001) %>%
+  select(code_muni, name_muni, tamanho_medio_dom)
 
+summary(ind8)
+# Não há dados faltantes
 
-## 9) Índice de Domicílios Unipessoais (IDU)
-ind9 <- base %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(idu = sum(domicilio01_V00033) / sum(domicilio01_V00001))
-
-
-# === 3. Indicadores de INFRAESTRUTURA ===========================
-
-## 10) Coleta de Lixo Adequada
-ind10 <- base %>%
+# Coleta de Lixo Adequada
+ind9 <- base_mun %>%
   mutate(
     lixo_adequado = domicilio02_V00397 + domicilio02_V00398,
-    lixo_total = rowSums(select(., domicilio02_V00397:domicilio02_V00403), na.rm = TRUE)
+    lixo_total    = domicilio02_V00397 + domicilio02_V00398 +
+      domicilio02_V00399 + domicilio02_V00400 +
+      domicilio02_V00401 + domicilio02_V00402 +
+      domicilio02_V00403,
+    coleta_lixo = lixo_adequado / lixo_total
   ) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_lixo = sum(lixo_adequado) / sum(lixo_total))
+  select(code_muni, name_muni, coleta_lixo)
 
+summary(ind9)
+# Não há dados faltantes
 
-## 11) Proporção de Esgoto Adequado
-ind11 <- base %>%
+# Esgoto Adequado
+ind10 <- base_mun %>%
   mutate(
+    esgoto_total    = domicilio02_V00309 + domicilio02_V00310 + domicilio02_V00311 +
+      domicilio02_V00312 + domicilio02_V00313 + domicilio02_V00314 +
+      domicilio02_V00315 + domicilio02_V00316,
     esgoto_adequado = domicilio02_V00309,
-    esgoto_total = rowSums(select(., domicilio02_V00309:domicilio02_V00316), na.rm = TRUE)
+    prop_esgoto = esgoto_adequado / esgoto_total
   ) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_esgoto = sum(esgoto_adequado) / sum(esgoto_total))
+  select(code_muni, name_muni, prop_esgoto)
 
+summary(ind10)
+# Não há dados faltantes
 
-## 12) Proporção de Domicílios com Internet
-ind12 <- base %>%
+# Domicílios com Internet
+ind11 <- base_mun %>%
   mutate(
-    dom_internet = rowSums(select(., domicilio02_V00290:domicilio02_V00305), na.rm = TRUE)
+    dom_internet = domicilio02_V00290 + domicilio02_V00291 + domicilio02_V00292 +
+      domicilio02_V00293 + domicilio02_V00294 + domicilio02_V00295 +
+      domicilio02_V00296 + domicilio02_V00297 + domicilio02_V00298 +
+      domicilio02_V00299 + domicilio02_V00300 + domicilio02_V00301 +
+      domicilio02_V00302 + domicilio02_V00303 + domicilio02_V00304 +
+      domicilio02_V00305,
+    prop_internet = dom_internet / domicilio01_V00001
   ) %>%
-  group_by(code_muni, name_muni) %>%
-  summarise(prop_internet = sum(dom_internet) / sum(domicilio01_V00001))
+  select(code_muni, name_muni, prop_internet)
 
-names(base)[grepl("^demografia_", names(base))]
-names(base)[grepl("^parentesco_", names(base))]
+summary(ind11)
+# Não há dados faltantes
 
-# === 4. Juntando os 12 indicadores ================================
+# Taxa de Renda Domiciliar Per Capita Municipal
+ind12 <- base_mun %>%
+  mutate(
+    renda_baixa = (V06001 + V06002) /
+      (V06001 + V06002 + V06003 + V06004 + V06005)*100000
+  ) %>%
+  select(code_muni, name_muni, renda_baixa)
 
-indicadores_municipios <- ind1 %>%
-  left_join(ind2) %>%
-  left_join(ind3) %>%
-  left_join(ind4) %>%
-  left_join(ind5) %>%
-  left_join(ind6) %>%
-  left_join(ind7) %>%
-  left_join(ind8) %>%
-  left_join(ind9) %>%
-  left_join(ind10) %>%
-  left_join(ind11) %>%
-  left_join(ind12)
+summary(ind12)
+# Não há dados faltantes
 
-summary(indicadores_municipios)
-names(base)[grepl("V0029", names(base))]
-names(base)[grepl("V003", names(base))]
-names(base)[grepl("^domicilio", names(base))]
+# Índice de Segurança Econômica (ISE)
+ind13 <- base_mun %>%
+  mutate(
+  baixa_renda = V06001 + V06002,
+  alta_renda  = V06004 + V06005,
+  ise = baixa_renda / alta_renda * 100000
+) %>%
+  select(code_muni, name_muni, ise)
 
-names(base)[grepl("V0039", names(base))]
+summary(ind13)
+# Não há dados faltantes
 
-names(base)[grepl("V0030", names(base))]
-names(base)[grepl("V0031", names(base))]
-names(base)[grepl("V0032", names(base))]
+# Fazendo o join com todos indicadores criados individualmente
+indicadores_df <- ind1 %>%
+  left_join(ind2,  by = c("code_muni","name_muni")) %>%
+  left_join(ind3,  by = c("code_muni","name_muni")) %>%
+  left_join(ind4,  by = c("code_muni","name_muni")) %>%
+  left_join(ind5,  by = c("code_muni","name_muni")) %>%
+  left_join(ind6,  by = c("code_muni","name_muni")) %>%
+  left_join(ind7,  by = c("code_muni","name_muni")) %>%
+  left_join(ind8,  by = c("code_muni","name_muni")) %>%
+  left_join(ind9,  by = c("code_muni","name_muni")) %>%
+  left_join(ind10, by = c("code_muni","name_muni")) %>%
+  left_join(ind11, by = c("code_muni","name_muni")) %>%
+  left_join(ind12, by = c("code_muni","name_muni")) %>%
+  left_join(ind13, by = c("code_muni","name_muni"))
 
-intersect(names(basico), names(pessoas)) |> intersect(names(domicilio)) |> intersect(names(responsavel_renda))
-
-
-names(read_tracts(2022, "Domicilio01", as_data_frame = TRUE))
-names(read_tracts(2022, "Domicilio02", as_data_frame = TRUE))
-names(read_tracts(2022, "Domicilio03", as_data_frame = TRUE))
-
-dic <- censobr::data_dictionary(year = 2022, dataset = "tracts")
-View(dic)
